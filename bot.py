@@ -7,7 +7,7 @@ import threading
 from datetime import datetime, timedelta
 
 
-TOKEN = os.getenv("STUDY_BOT_TOKEN", "8662823218:AAFvqvbhGAMppfR_IrIaojk3EocViL3nfnM")
+TOKEN = "8662823218:AAFvqvbhGAMppfR_IrIaojk3EocViL3nfnM"
 URL = f"https://api.telegram.org/bot{TOKEN}"
 
 active_sessions = {}
