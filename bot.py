@@ -6,819 +6,398 @@ import re
 import threading
 from datetime import datetime, timedelta
 
-# #HESHVM - Modified manually by HESHVM with full power and precision ✍️
+# ================= إعدادات البوت (قم بتعديلها) =================
+TOKEN = os.getenv("STUDY_BOT_TOKEN", "8285457029:AAGzgyfW8ASNBoXuKp5f1RFzTTWEkPIiANI")
+DEV_ID = 8554620638  # ⚠️ ضع الآيدي الخاص بك هنا لتتحكم بالبوت
+FORCE_CHANNEL = ""  # ⚠️ ضع معرف قناتك للاشتراك الإجباري (أو اتركه فارغاً "")
 
-TOKEN = os.getenv("STUDY_BOT_TOKEN", "8662823218:AAFvqvbhGAMppfR_IrIaojk3EocViL3nfnM")
 URL = f"https://api.telegram.org/bot{TOKEN}"
+avetaar_session = requests.Session()  # بصمة مخفية وتسريع للاتصال
 
-# ─── Developers ───────────────────────────────────────────────
-DEVELOPERS = {
-    8554620638: "@M_X_K1",
-    8554620638: "@M_X_K1",
-}
+# ================= قواعد البيانات =================
+AVETAAR_DB_FILE = "bot_data.json"
 
-# ─── Bot State ────────────────────────────────────────────────
-active_sessions = {}
-session_locks = threading.Lock()
+def load_avetaar_db():
+    if os.path.exists(AVETAAR_DB_FILE):
+        with open(AVETAAR_DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"users": [], "groups": [], "banned":[]}
 
-bot_enabled = True           # تفعيل/تعليق البوت
-forced_channels = []         # قائمة القنوات الإجبارية
-known_users = {}             # {user_id: {"name": ..., "username": ..., "joined": ...}}
-user_locks = threading.Lock()
-state_lock = threading.Lock()
+def save_avetaar_db(data):
+    with open(AVETAAR_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
-# ─── Helpers ──────────────────────────────────────────────────
+db = load_avetaar_db()
 
-def is_developer(user_id: int) -> bool:
-    return user_id in DEVELOPERS
+# الجلسات النشطة
+avetaar_active_camps = {}
+avetaar_lock = threading.Lock()
 
-
+# ================= دوال الاتصال الأساسية =================
 def req(method, json_data=None, params=None):
     try:
-        if json_data is not None:
-            r = requests.post(f"{URL}/{method}", json=json_data, timeout=20)
-        elif params is not None:
-            r = requests.post(f"{URL}/{method}", data=params, timeout=20)
+        if json_data:
+            r = avetaar_session.post(f"{URL}/{method}", json=json_data, timeout=20)
+        elif params:
+            r = avetaar_session.post(f"{URL}/{method}", data=params, timeout=20)
         else:
-            r = requests.post(f"{URL}/{method}", timeout=20)
+            r = avetaar_session.post(f"{URL}/{method}", timeout=20)
         return r.json() if r.text else {"ok": False}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
-def send_message(chat_id, text, parse_mode=None, disable_web_page_preview=True, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": disable_web_page_preview,
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+def send_message(chat_id, text, parse_mode="HTML", reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True, "parse_mode": parse_mode}
+    if reply_markup: payload["reply_markup"] = reply_markup
     return req("sendMessage", json_data=payload)
 
-
-def edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+def edit_message(chat_id, message_id, text, parse_mode="HTML", reply_markup=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup: payload["reply_markup"] = reply_markup
     return req("editMessageText", json_data=payload)
 
+def get_chat_member(chat_id, user_id):
+    res = req("getChatMember", params={"chat_id": chat_id, "user_id": user_id})
+    if res.get("ok"): return res["result"]["status"]
+    return None
 
-def answer_callback(callback_id, text="", show_alert=False):
-    req("answerCallbackQuery", json_data={
-        "callback_query_id": callback_id,
-        "text": text,
-        "show_alert": show_alert,
-    })
+def is_admin_or_creator(chat_id, user_id):
+    if user_id == DEV_ID: return True
+    status = get_chat_member(chat_id, user_id)
+    return status in ["administrator", "creator"]
 
+def check_force_join(user_id):
+    if not FORCE_CHANNEL or user_id == DEV_ID: return True
+    status = get_chat_member(FORCE_CHANNEL, user_id)
+    return status in["member", "administrator", "creator"]
 
-def get_chat_member_status(channel, user_id):
-    result = req("getChatMember", json_data={"chat_id": channel, "user_id": user_id})
-    if result.get("ok"):
-        return result["result"]["status"]
-    return "left"
-
-
-def is_user_subscribed(user_id: int) -> bool:
-    """تحقق أن المستخدم مشترك في كل القنوات الإجبارية"""
-    with state_lock:
-        channels = list(forced_channels)
-    for ch in channels:
-        status = get_chat_member_status(ch, user_id)
-        if status in ("left", "kicked"):
-            return False
-    return True
-
-
-def get_bot_admin_status(channel) -> bool:
-    """هل البوت أدمن في القناة/الجروب؟"""
-    result = req("getMe", json_data={})
-    if not result.get("ok"):
-        return False
-    bot_id = result["result"]["id"]
-    status = get_chat_member_status(channel, bot_id)
-    return status in ("administrator", "creator")
-
-
-def register_user(user):
-    uid = user["id"]
-    with user_locks:
-        if uid not in known_users:
-            known_users[uid] = {
-                "name": user.get("first_name", ""),
-                "username": user.get("username", ""),
-                "joined": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            }
-
-
-def notify_developers(text, parse_mode=None):
-    for dev_id in DEVELOPERS:
-        send_message(dev_id, text, parse_mode=parse_mode)
-
-# ─── Subscription Check Keyboard ──────────────────────────────
-
-def subscription_keyboard():
-    with state_lock:
-        channels = list(forced_channels)
-    buttons = []
-    for ch in channels:
-        label = ch if ch.startswith("@") else ch
-        buttons.append([{"text": f"📢 اشترك في {label}", "url": f"https://t.me/{ch.lstrip('@')}"}])
-    buttons.append([{"text": "✅ تحققت من اشتراكي", "callback_data": "check_subscription"}])
-    return json.dumps({"inline_keyboard": buttons})
-
-
-def subscription_message(chat_id, user_name=""):
-    with state_lock:
-        channels = list(forced_channels)
-    channels_list = "\n".join([f"   • {ch}" for ch in channels])
-    text = (
-        f"👋 مرحباً {user_name}!\n\n"
-        f"⚠️ *يجب عليك الاشتراك في القنوات التالية أولاً لاستخدام البوت:*\n\n"
-        f"{channels_list}\n\n"
-        f"بعد الاشتراك اضغط زرار التحقق ✅"
-    )
-    send_message(chat_id, text, parse_mode="Markdown", reply_markup=subscription_keyboard())
-
-# ─── Texts ────────────────────────────────────────────────────
-
+# ================= النصوص والتصميم =================
 WELCOME_TEXT = (
-    "Welcome To Study bot\n\n"
-    "👈🏻  استخدم الأمر مع الوقت المطلوب لتحديد مدة المذاكرة\n"
-    "   • <code>/start 2h30m</code>  ➡️ لمدة ساعتان ونصف\n"
-    "   • <code>/start 45m</code>    ➡️ لمدة 45 دقيقة\n"
-    "   • <code>/s_10m</code>        ➡️ اختصار سريع لـ 10 دقائق\n\n"
-    "<b>📌 ملاحظة : يمكنك تحديد المدة بكتابة <code>/start</code> متبوعة بالمدة والاختصار المناسب.</b>\n"
-    "   مثال: <code>/start 5h</code> ➡️ لمدة 5 ساعات\n"
-    "————————————————————\n"
-    "<b>🔹 الاختصارات يغالي عشان تعرف تستخدم البوت 🔹</b>\n"
-    "   <code>h</code> = ساعات • <code>m</code> = دقائق • <code>s</code> = ثواني\n"
-    "————————————————————\n"
-    "<b>متنساش تصلي على النبي و تستغفر ربنا قبل متبدأ معسكر ⛔️.</b>"
+    "<b>أهلاً بك في بوت المعسكرات 🏕 (Study Bot)</b>\n\n"
+    "بوت متخصص لعمل معسكرات مذاكرة جماعية أو فردية، لترتيب وقتك وإنجاز مهامك.\n\n"
+    "<b>كيف أبدأ معسكر؟ ⛔️</b>\n"
+    "👈🏻 أرسل الأمر <code>/start</code> متبوعاً بالوقت:\n"
+    "   • <code>/start 2h30m</code> ➡️ معسكر لساعتين ونصف\n"
+    "   • <code>/start 45m</code>   ➡️ معسكر لـ 45 دقيقة\n"
+    "   • <code>/s_10m</code>       ➡️ اختصار سريع لـ 10 دقائق\n\n"
+    "<b>الاختصارات:</b> <code>h</code> (ساعات) • <code>m</code> (دقائق) • <code>s</code> (ثواني)\n\n"
+    "<i>متنساش تصلي على النبي وتستغفر ربنا قبل متبدأ معسكرك 🤍.</i>"
 )
 
-DUA_LIST = [
-    "اللهم إنّي أسألك فهم النبيين، وحفظ المرسلين، وإلهام الملائكة المقربين،\n   اللهم اجعل ألسنتنا عامرة بذكرك وقلوبنا بطاعتك.",
-    "اللهم إني أستودعك ما علمتني فاحفظه لي في ذهني وعقلي وقلبي،\n   اللهم ردده علي عند حاجتي إليه، ولا تنسيني إياه يا حي يا قيوم.",
-    "رب اشرح لي صدري ويسر لي أمري واحلل عقدة من لساني يفقهوا قولي،\n   اللهم لا سهل إلا ما جعلته سهلاً وأنت تجعل الحزن إذا شئت سهلاً."
-]
-
-# ─── Duration Parsing ─────────────────────────────────────────
+DUA = "اللهم إنّي أسألك فهم النبيين، وحفظ المرسلين، وإلهام الملائكة المقربين، اللهم اجعل ألسنتنا عامرة بذكرك وقلوبنا بطاعتك."
 
 def parse_duration(duration_str):
-    duration_str = duration_str.replace(" ", "").lower()
-    duration_str = duration_str.replace("س", "h").replace("د", "m").replace("ث", "s")
-    pattern = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
-    match = pattern.fullmatch(duration_str)
-    if not match:
-        return None
-    hours = int(match.group(1)) if match.group(1) else 0
-    minutes = int(match.group(2)) if match.group(2) else 0
-    seconds = int(match.group(3)) if match.group(3) else 0
-    total = hours * 3600 + minutes * 60 + seconds
+    duration_str = duration_str.replace(" ", "").lower().replace("س", "h").replace("د", "m").replace("ث", "s")
+    match = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$").fullmatch(duration_str)
+    if not match: return None
+    h, m, s =[int(g) if g else 0 for g in match.groups()]
+    total = h*3600 + m*60 + s
     return total if total > 0 else None
 
-
 def format_time(seconds):
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
+    return f"{seconds//3600:02d}:{(seconds%3600)//60:02d}:{seconds%60:02d}"
 
 def format_datetime(dt):
     return dt.strftime("%I:%M %p").lstrip("0")
 
-# ─── Timer Thread ─────────────────────────────────────────────
+# ================= محرك المعسكرات (Avetaar Engine) =================
+def build_camp_keyboard(session_key):
+    return {
+        "inline_keyboard":[[{"text": "انضمام 👥", "callback_data": f"join_{session_key}"}],[{"text": "⏸ إيقاف مؤقت", "callback_data": f"pause_{session_key}"}, 
+             {"text": "▶️ استئناف", "callback_data": f"resume_{session_key}"}],[{"text": "🛑 إنهاء المعسكر", "callback_data": f"stop_{session_key}"}]
+        ]
+    }
 
-def update_timer(chat_id, session_key, duration_str):
-    while session_key in active_sessions and active_sessions[session_key]["status"] == "active":
+def end_camp_avetaar(chat_id, session_key, session_data):
+    duration_str = session_data["duration_str"]
+    participants = session_data.get("participants", {})
+    participants_list =[f"{i+1}- {p}" for i, p in enumerate(participants.values())]
+    part_text = "\n".join(participants_list) if participants_list else "لا يوجد مشاركين 💔"
+    
+    end_message = (
+        f"✅ - <b>تم انهاء المعسكر بنجاح</b> .\n"
+        f"👥 <b>المشاركين في هذا المعسكر</b> :\n\n"
+        f"{part_text}\n\n"
+        f"⏱ <b>كان زمن هذا المعسكر ( {duration_str} )</b> \n"
+        f"🤍 <b>ان شاء الله تكونو انجزتو كويس في المعسكر و خلصتو جزء من الي عليكم .</b>"
+    )
+    send_message(chat_id, end_message)
+
+def update_timer_avetaar(chat_id, session_key):
+    UPDATE_INTERVAL = 10 
+    while session_key in avetaar_active_camps and avetaar_active_camps[session_key]["status"] == "active":
         try:
-            session = active_sessions[session_key]
+            session = avetaar_active_camps[session_key]
             now = datetime.now()
             end_time = datetime.fromisoformat(session["end_time"])
-
+            
             if now >= end_time:
-                with session_locks:
-                    if session_key in active_sessions:
-                        participants = session.get("participants", {})
-                        participants_list = []
-                        for participant in participants.values():
-                            participants_list.append(f"{len(participants_list) + 1} {participant}")
-
-                        participants_text = "\n".join(participants_list) if participants_list else "لا يوجد مشاركين"
-
-                        end_message = (
-                            f"*تم انهاء المعسكر بنجاح* ✅\n\n"
-                            f"*المشاركين في هذا المعسكر* 👥\n\n"
-                            f"{participants_text}\n\n"
-                            f"*كان زمن هذا المعسكر* ( `{duration_str}` ) *⏱️*\n"
-                            f"*ان شاء الله تكونو انجزتو كويس في المعسكر و خلصتو جزء من الي عليكم* 🖤"
-                        )
-
-                        send_message(chat_id, end_message, parse_mode="Markdown")
-                        del active_sessions[session_key]
+                with avetaar_lock:
+                    if session_key in avetaar_active_camps:
+                        end_camp_avetaar(chat_id, session_key, session)
+                        del avetaar_active_camps[session_key]
                 break
-
+            
             remaining = int((end_time - now).total_seconds())
             start_time = datetime.fromisoformat(session["start_time"])
-            participants_count = len(session.get("participants", {}))
-
+            p_count = len(session.get("participants", {}))
+            
             msg_text = (
-                f"*✨ دعـاء المذاكـرة (قبل البدء):*\n"
+                f"✨ <b>دعـاء المذاكـرة (قبل البدء):</b>\n"
                 f"» {session['dua']}\n\n"
-                f"*⏳ الوقت المتبقي:* `{format_time(remaining)}`\n"
-                f"*⏱️ المدة المحددة:* `{duration_str}`\n"
-                f"*🕒 وقت البدء:* `{format_datetime(start_time)}`\n"
-                f"*🎯 وقت الانتهاء:* `{format_datetime(end_time)}`\n"
-                f"*👥 عدد المشاركين حالياً:* `{participants_count}`\n"
-                f"————————————————————\n"
-                f"• لإيقاف المؤقت: `/stop` | لاستئنافه: `/ready`"
+                f"⏳ <b>الوقت المتبقي:</b> <code>{format_time(remaining)}</code>\n"
+                f"⏱️ <b>المدة المحددة:</b> <code>{session['duration_str']}</code>\n"
+                f"🕒 <b>وقت البدء:</b> <code>{format_datetime(start_time)}</code>\n"
+                f"🎯 <b>وقت الانتهاء:</b> <code>{format_datetime(end_time)}</code>\n"
+                f"👥 <b>عدد المشاركين حالياً:</b> <code>{p_count}</code>\n"
             )
-
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "انضمام 👥", "callback_data": f"join_{session_key}"}]
-                ]
-            }
-
+            
+            keyboard = build_camp_keyboard(session_key)
+            
             if "message_id" not in session:
-                result = send_message(chat_id, msg_text, parse_mode="Markdown", reply_markup=json.dumps(keyboard))
-                if result.get("ok"):
-                    session["message_id"] = result["result"]["message_id"]
+                res = send_message(chat_id, msg_text, reply_markup=json.dumps(keyboard))
+                if res.get("ok"): session["message_id"] = res["result"]["message_id"]
             else:
-                edit_message(chat_id, session["message_id"], msg_text, parse_mode="Markdown", reply_markup=json.dumps(keyboard))
-
-            time.sleep(0.7)
+                edit_message(chat_id, session["message_id"], msg_text, reply_markup=json.dumps(keyboard))
+            
+            time.sleep(UPDATE_INTERVAL)
         except Exception as e:
-            print(f"Timer update error: {e}")
-            break
+            time.sleep(5)
 
-# ─── Admin Panel ──────────────────────────────────────────────
-
-def panel_keyboard():
-    global bot_enabled
-    toggle_label = "🔴 تعطيل البوت" if bot_enabled else "🟢 تفعيل البوت"
-    return json.dumps({
-        "inline_keyboard": [
-            [{"text": toggle_label, "callback_data": "panel_toggle"}],
-            [{"text": "👥 المستخدمين", "callback_data": "panel_users"}],
-            [{"text": "📢 القنوات الإجبارية", "callback_data": "panel_channels"}],
-            [{"text": "📊 إحصائيات", "callback_data": "panel_stats"}],
-            [{"text": "📋 الجلسات النشطة", "callback_data": "panel_sessions"}],
-            [{"text": "📣 رسالة جماعية", "callback_data": "panel_broadcast"}],
-            [{"text": "🗑 مسح جميع الجلسات", "callback_data": "panel_clear_sessions"}],
-            [{"text": "🔧 المطورين", "callback_data": "panel_devs"}],
-        ]
-    })
-
-
-def panel_text():
-    global bot_enabled
-    status = "✅ مفعّل" if bot_enabled else "❌ معطّل"
-    with state_lock:
-        ch_count = len(forced_channels)
-    with user_locks:
-        u_count = len(known_users)
-    with session_locks:
-        s_count = len(active_sessions)
-    return (
-        f"*🎛 لوحة تحكم المطور*\n"
-        f"————————————————————\n"
-        f"*حالة البوت:* {status}\n"
-        f"*👥 إجمالي المستخدمين:* `{u_count}`\n"
-        f"*📢 القنوات الإجبارية:* `{ch_count}`\n"
-        f"*⏱ الجلسات النشطة:* `{s_count}`\n"
-        f"————————————————————\n"
-        f"اختر إجراءً من القائمة أدناه:"
-    )
-
-
-def handle_panel_callback(callback_query, data):
-    global bot_enabled
-    chat_id = callback_query["message"]["chat"]["id"]
-    message_id = callback_query["message"]["message_id"]
-    cid = callback_query["id"]
-    user_id = callback_query["from"]["id"]
-
-    if not is_developer(user_id):
-        answer_callback(cid, "⛔️ ليس لديك صلاحية!", show_alert=True)
-        return
-
-    if data == "panel_toggle":
-        with state_lock:
-            bot_enabled = not bot_enabled
-        status = "✅ تم تفعيل البوت" if bot_enabled else "❌ تم تعطيل البوت"
-        answer_callback(cid, status, show_alert=True)
-        edit_message(chat_id, message_id, panel_text(), parse_mode="Markdown", reply_markup=panel_keyboard())
-
-    elif data == "panel_users":
-        with user_locks:
-            users = dict(known_users)
-        if not users:
-            answer_callback(cid, "لا يوجد مستخدمين بعد", show_alert=True)
-            return
-        lines = [f"*👥 قائمة المستخدمين ({len(users)}):*\n"]
-        for i, (uid, info) in enumerate(users.items(), 1):
-            uname = f"@{info['username']}" if info['username'] else info['name']
-            lines.append(f"{i}. {uname} — `{uid}` — {info['joined']}")
-        text = "\n".join(lines)
-        # إرسال كرسالة منفصلة لأنها قد تكون طويلة
-        send_message(chat_id, text[:4096], parse_mode="Markdown")
-        answer_callback(cid)
-
-    elif data == "panel_channels":
-        with state_lock:
-            channels = list(forced_channels)
-        if not channels:
-            ch_text = "لا توجد قنوات إجبارية مضافة."
-        else:
-            ch_text = "\n".join([f"• {ch}" for ch in channels])
-        text = (
-            f"*📢 القنوات الإجبارية الحالية:*\n\n{ch_text}\n\n"
-            f"لإضافة قناة: `/addchannel @username`\n"
-            f"لحذف قناة: `/removechannel @username`"
-        )
-        keyboard = json.dumps({"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "panel_back"}]]})
-        edit_message(chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard)
-        answer_callback(cid)
-
-    elif data == "panel_stats":
-        with user_locks:
-            u_count = len(known_users)
-        with session_locks:
-            s_count = len(active_sessions)
-        with state_lock:
-            ch_count = len(forced_channels)
-            enabled = bot_enabled
-        text = (
-            f"*📊 إحصائيات البوت*\n"
-            f"————————————————————\n"
-            f"*👥 المستخدمين:* `{u_count}`\n"
-            f"*⏱ جلسات نشطة:* `{s_count}`\n"
-            f"*📢 قنوات إجبارية:* `{ch_count}`\n"
-            f"*حالة البوت:* {'✅ مفعّل' if enabled else '❌ معطّل'}\n"
-            f"*🕒 التاريخ:* `{datetime.now().strftime('%Y-%m-%d %H:%M')}`"
-        )
-        keyboard = json.dumps({"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "panel_back"}]]})
-        edit_message(chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard)
-        answer_callback(cid)
-
-    elif data == "panel_sessions":
-        with session_locks:
-            sessions = dict(active_sessions)
-        if not sessions:
-            answer_callback(cid, "لا توجد جلسات نشطة حالياً", show_alert=True)
-            return
-        lines = [f"*📋 الجلسات النشطة ({len(sessions)}):*\n"]
-        for key, s in sessions.items():
-            end = datetime.fromisoformat(s["end_time"])
-            remaining = max(0, int((end - datetime.now()).total_seconds()))
-            participants = len(s.get("participants", {}))
-            lines.append(
-                f"• `{key}` | {s.get('duration_str','?')} | متبقي: {format_time(remaining)} | مشاركين: {participants}"
-            )
-        send_message(chat_id, "\n".join(lines)[:4096], parse_mode="Markdown")
-        answer_callback(cid)
-
-    elif data == "panel_broadcast":
-        answer_callback(cid)
-        send_message(chat_id,
-            "*📣 أرسل الرسالة التي تريد إرسالها لجميع المستخدمين:*\n"
-            "_(أرسل الرسالة كرد على هذه الرسالة أو أرسل /broadcast ثم الرسالة)_",
-            parse_mode="Markdown")
-
-    elif data == "panel_clear_sessions":
-        with session_locks:
-            count = len(active_sessions)
-            active_sessions.clear()
-        answer_callback(cid, f"✅ تم مسح {count} جلسة", show_alert=True)
-        edit_message(chat_id, message_id, panel_text(), parse_mode="Markdown", reply_markup=panel_keyboard())
-
-    elif data == "panel_devs":
-        devs = "\n".join([f"• {uname} — `{uid}`" for uid, uname in DEVELOPERS.items()])
-        text = f"*🔧 المطورون:*\n\n{devs}"
-        keyboard = json.dumps({"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "panel_back"}]]})
-        edit_message(chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard)
-        answer_callback(cid)
-
-    elif data == "panel_back":
-        edit_message(chat_id, message_id, panel_text(), parse_mode="Markdown", reply_markup=panel_keyboard())
-        answer_callback(cid)
-
-# ─── Handlers ─────────────────────────────────────────────────
-
-def handle_my_chat_member(chat_member_update):
-    chat_id = chat_member_update["chat"]["id"]
-    old_status = chat_member_update["old_chat_member"]["status"]
-    new_status = chat_member_update["new_chat_member"]["status"]
-
-    if old_status in ["member", "restricted"] and new_status == "administrator":
-        group_welcome = (
-            "*شكرا لأضافتي في المجموعة* 🫂🖤\n\n"
-            "*بعض التعليمات المهمه عني لكي تستطيع استخدامي جيدا* 👇:\n"
-            "يجب عليك رفع البوت مشرف في المجموعه و فتح الصلاحيات التالية:\n"
-            "*• صلاحية حذف الرسائل*\n"
-            "*• صلاحية تعديل الرسائل*\n"
-            "*• صلاحية تثبيت الرسائل*\n\n"
-            "*كيفية استخدامي* ⛔️:\n"
-            "👈🏻  استخدم الأمر مع الوقت المطلوب لتحديد مدة المعسكر\n"
-            "   - `/start 2h30m`  ➡️ لمدة ساعتان ونصف\n"
-            "   - `/start 45m`        ➡️ لمدة 45 دقيقة"
-        )
-        send_message(chat_id, group_welcome, parse_mode="Markdown")
-
-
-# حالة انتظار البرودكاست
-broadcast_waiting = set()
-
-
+# ================= معالجة الرسائل =================
 def handle_message(message):
-    global bot_enabled
     chat_id = message["chat"]["id"]
     user_id = message["from"]["id"]
     text = message.get("text", "")
     chat_type = message["chat"]["type"]
-    user = message["from"]
+    first_name = message["from"].get("first_name", "")
+    username = message["from"].get("username", "")
 
-    # تسجيل المستخدم دائماً
-    register_user(user)
+    if user_id in db["banned"]: return
 
-    # ─── أوامر المطور (تعمل حتى لو البوت معطّل) ────────────────
+    # تسجيل الأعضاء والجروبات
+    if chat_type == "private":
+        if user_id not in db["users"]:
+            db["users"].append(user_id)
+            save_avetaar_db(db)
+            u_link = f"@{username}" if username else f"<a href='tg://user?id={user_id}'>{first_name}</a>"
+            send_message(DEV_ID, f"🔔 <b>دخول جديد!</b>\n👤 العضو: {u_link}\n🆔 الآيدي: <code>{user_id}</code>")
+    else:
+        if chat_id not in db["groups"]:
+            db["groups"].append(chat_id)
+            save_avetaar_db(db)
 
-    if text == "/panel":
-        if not is_developer(user_id):
-            send_message(chat_id, "⛔️ هذا الأمر للمطورين فقط.")
-            return
-        send_message(chat_id, panel_text(), parse_mode="Markdown", reply_markup=panel_keyboard())
+    # الاشتراك الإجباري الأنيق المعتمد على الأزرار
+    if not check_force_join(user_id):
+        sub_kb = {"inline_keyboard": [[{"text": "📢 اضغط هنا للاشتراك", "url": f"https://t.me/{FORCE_CHANNEL.replace('@', '')}"}],[{"text": "✅ تحقق من الاشتراك", "callback_data": "check_sub"}]
+        ]}
+        send_message(chat_id, f"🚫 <b>عذراً عزيزي، يجب عليك الاشتراك في قناة البوت أولاً لتتمكن من استخدامه.</b>\n\nاشترك ثم اضغط تحقق:", reply_markup=json.dumps(sub_kb))
         return
 
-    if text.startswith("/addchannel"):
-        if not is_developer(user_id):
-            send_message(chat_id, "⛔️ هذا الأمر للمطورين فقط.")
+    # أوامر المطور
+    if user_id == DEV_ID and chat_type == "private":
+        if text == "/admin" or text == "لوحة المطور":
+            admin_kb = {"inline_keyboard": [[{"text": "📊 الإحصائيات", "callback_data": "admin_stats"}],[{"text": "📢 أوامر الإذاعة والحظر", "callback_data": "admin_help"}]
+            ]}
+            send_message(chat_id, "👨🏻‍💻 <b>أهلاً بك يا (Avetaar) في لوحة التحكم:</b>", reply_markup=json.dumps(admin_kb))
             return
-        parts = text.split()
-        if len(parts) < 2:
-            send_message(chat_id, "❌ استخدام: `/addchannel @channel_username`", parse_mode="Markdown")
+        if text.startswith("/broadcast "):
+            msg = text.replace("/broadcast ", "")
+            send_message(chat_id, "⏳ <b>جاري الإذاعة...</b>")
+            count = sum(1 for uid in db["users"] + db["groups"] if send_message(uid, f"📢 <b>رسالة إدارية:</b>\n\n{msg}").get("ok"))
+            send_message(chat_id, f"✅ <b>تمت الإذاعة لـ {count} دردشة.</b>")
             return
-        channel = parts[1]
-        if not channel.startswith("@"):
-            send_message(chat_id, "❌ يجب أن يبدأ اليوزر بـ @")
+        if text.startswith("/ban "):
+            bid = int(text.split()[1])
+            if bid not in db["banned"]: db["banned"].append(bid); save_avetaar_db(db)
+            send_message(chat_id, f"✅ <b>تم حظر {bid}</b>")
             return
-        # تحقق أن البوت أدمن في القناة
-        if not get_bot_admin_status(channel):
-            send_message(chat_id, f"❌ البوت ليس مشرفاً في {channel}!\nأضف البوت كمشرف أولاً ثم أعد المحاولة.")
+        if text.startswith("/unban "):
+            bid = int(text.split()[1])
+            if bid in db["banned"]: db["banned"].remove(bid); save_avetaar_db(db)
+            send_message(chat_id, f"✅ <b>تم إلغاء حظر {bid}</b>")
             return
-        with state_lock:
-            if channel not in forced_channels:
-                forced_channels.append(channel)
-                send_message(chat_id, f"✅ تم إضافة القناة الإجبارية: {channel}")
-            else:
-                send_message(chat_id, f"⚠️ القناة {channel} مضافة بالفعل!")
-        return
 
-    if text.startswith("/removechannel"):
-        if not is_developer(user_id):
-            send_message(chat_id, "⛔️ هذا الأمر للمطورين فقط.")
-            return
-        parts = text.split()
-        if len(parts) < 2:
-            send_message(chat_id, "❌ استخدام: `/removechannel @channel_username`", parse_mode="Markdown")
-            return
-        channel = parts[1]
-        with state_lock:
-            if channel in forced_channels:
-                forced_channels.remove(channel)
-                send_message(chat_id, f"✅ تم حذف القناة الإجبارية: {channel}")
-            else:
-                send_message(chat_id, f"⚠️ القناة {channel} غير موجودة في القائمة!")
-        return
-
-    if text.startswith("/broadcast"):
-        if not is_developer(user_id):
-            send_message(chat_id, "⛔️ هذا الأمر للمطورين فقط.")
-            return
-        parts = text.split(None, 1)
-        if len(parts) < 2:
-            broadcast_waiting.add(user_id)
-            send_message(chat_id, "📣 أرسل الآن الرسالة التي تريد إرسالها لجميع المستخدمين:")
-            return
-        broadcast_text = parts[1]
-        _do_broadcast(chat_id, broadcast_text)
-        return
-
-    # معالجة رسائل البرودكاست المنتظَرة
-    if user_id in broadcast_waiting:
-        broadcast_waiting.discard(user_id)
-        _do_broadcast(chat_id, text)
-        return
-
-    # ─── فحص تفعيل البوت ────────────────────────────────────────
-    if not bot_enabled:
-        send_message(chat_id, "⏸ البوت معطّل مؤقتاً من قِبل المطورين.")
-        return
-
-    # ─── فحص الاشتراك الإجباري ──────────────────────────────────
-    with state_lock:
-        channels = list(forced_channels)
-    if channels and not is_user_subscribed(user_id):
-        user_name = user.get("first_name", "")
-        subscription_message(chat_id, user_name)
-        return
-
-    # ─── الأوامر العادية ─────────────────────────────────────────
-
+    # الأوامر الرئيسية
     if text == "/start":
-        send_message(chat_id, WELCOME_TEXT, parse_mode="HTML")
+        if chat_type == "private":
+            main_kb = {"inline_keyboard": [[{"text": "🏕 كيفية إنشاء معسكر؟", "callback_data": "help_camp"}],[{"text": "👨‍💻 مطور البوت", "url": "tg://user?id=" + str(DEV_ID)}]
+            ]}
+            send_message(chat_id, WELCOME_TEXT, reply_markup=json.dumps(main_kb))
+        else:
+            send_message(chat_id, WELCOME_TEXT)
+        return
+        
+    if text.startswith("/start ") or text.startswith("/s_"):
+        duration_str = text.split()[1] if text.startswith("/start ") and len(text.split()) > 1 else text[3:]
+        duration = parse_duration(duration_str)
+        
+        if not duration:
+            send_message(chat_id, "❌ <b>صيغة الوقت غير صحيحة!</b>\nاستخدم مثلاً: <code>/start 1h30m</code> أو <code>/s_10m</code>")
+            return
+        
+        session_key = str(chat_id)
+        if session_key in avetaar_active_camps:
+            send_message(chat_id, "⏳ <b>هناك معسكر نشط حالياً! استخدم الأزرار للتحكم به.</b>")
+            return
+            
+        start_time = datetime.now()
+        end_time = start_time + timedelta(seconds=duration)
+        
+        with avetaar_lock:
+            avetaar_active_camps[session_key] = {
+                "status": "active",
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "dua": DUA,
+                "duration_str": duration_str,
+                "participants": {},
+                "starter_id": user_id 
+            }
+        
+        threading.Thread(target=update_timer_avetaar, args=(chat_id, session_key), daemon=True).start()
         return
 
-    if text.startswith("/start "):
-        parts = text.split()
-        if len(parts) > 1:
-            duration_str = parts[1]
-            duration = parse_duration(duration_str)
-            if not duration:
-                send_message(chat_id, "❌ صيغة الوقت غير صحيحة! استخدم مثلاً: /start 1h30m")
+# ================= معالجة الأزرار (Callbacks) =================
+def handle_callback_avetaar(call):
+    chat_id = call["message"]["chat"]["id"]
+    msg_id = call["message"]["message_id"]
+    user_id = call["from"]["id"]
+    data = call["data"]
+    username = call["from"].get("username")
+    first_name = call["from"].get("first_name", "بدون اسم")
+
+    def answer(text, alert=False):
+        req("answerCallbackQuery", json_data={"callback_query_id": call["id"], "text": text, "show_alert": alert})
+
+    # زر التحقق من الاشتراك
+    if data == "check_sub":
+        if check_force_join(user_id):
+            answer("✅ شكراً لك! تم تفعيل البوت، أرسل /start الآن.", True)
+            req("deleteMessage", json_data={"chat_id": chat_id, "message_id": msg_id})
+        else:
+            answer("❌ لم تقم بالاشتراك بعد!", True)
+        return
+
+    # أزرار المساعدة والمطور
+    if data == "help_camp":
+        answer("أرسل /start متبوعاً بالوقت، مثلاً /start 1h لبدء معسكر لمدة ساعة.", True)
+        return
+    if data == "admin_stats":
+        if user_id == DEV_ID:
+            answer(f"المستخدمين: {len(db['users'])}\nالجروبات: {len(db['groups'])}\nالمحظورين: {len(db['banned'])}", True)
+        return
+    if data == "admin_help":
+        if user_id == DEV_ID:
+            answer("للإذاعة: /broadcast + رسالتك\nللحظر: /ban + الايدي\nلفك الحظر: /unban + الايدي", True)
+        return
+
+    # الاشتراك الإجباري قبل الانضمام للمعسكر
+    if not check_force_join(user_id):
+        answer("🚫 يجب عليك الاشتراك في قناة البوت أولاً!", True)
+        return
+
+    # أزرار المعسكر (انضمام، إيقاف، استئناف، إنهاء)
+    if "_" in data:
+        action, session_key = data.split("_", 1)
+        
+        with avetaar_lock:
+            if session_key not in avetaar_active_camps:
+                answer("❌ هذا المعسكر انتهى أو غير موجود.")
+                return
+                
+            session = avetaar_active_camps[session_key]
+            starter = session.get("starter_id")
+            
+            # زر الانضمام (متاح للجميع)
+            if action == "join":
+                part_name = f"المستخدم ( @{username} )" if username else f"المستخدم ( {first_name} )"
+                if str(user_id) in session["participants"]:
+                    answer("⚠️ أنت منضم سابقاً بالفعل!")
+                else:
+                    session["participants"][str(user_id)] = part_name
+                    answer("✅ تم انضمامك للمعسكر بنجاح!")
                 return
 
-            session_key = f"{chat_id}:0"
-            if session_key in active_sessions:
-                send_message(chat_id, "⏳ هناك جلسة نشطة حالياً. قم بإيقافها أولاً بـ /stop")
+            # أزرار التحكم (متاحة لصاحب المعسكر والمشرفين والمطور فقط)
+            if user_id != starter and not is_admin_or_creator(chat_id, user_id):
+                answer("🚫 عذراً، فقط من أنشأ المعسكر أو المشرفين يمكنهم التحكم به!", True)
                 return
 
-            start_time = datetime.now()
-            end_time = start_time + timedelta(seconds=duration)
-
-            with session_locks:
-                active_sessions[session_key] = {
-                    "status": "active",
-                    "start_time": start_time.isoformat(),
-                    "end_time": end_time.isoformat(),
-                    "dua": DUA_LIST[0],
-                    "duration_str": duration_str,
-                    "participants": {},
-                    "chat_type": chat_type,
-                }
-
-            timer_thread = threading.Thread(
-                target=update_timer,
-                args=(chat_id, session_key, duration_str),
-                daemon=True,
-            )
-            timer_thread.start()
-        return
-
-    if text.startswith("/s_"):
-        shortcut = text[3:]
-        duration = parse_duration(shortcut)
-        if duration:
-            session_key = f"{chat_id}:{user_id}"
-            if session_key not in active_sessions:
-                start_time = datetime.now()
-                end_time = start_time + timedelta(seconds=duration)
-
-                with session_locks:
-                    active_sessions[session_key] = {
-                        "status": "active",
-                        "start_time": start_time.isoformat(),
-                        "end_time": end_time.isoformat(),
-                        "dua": DUA_LIST[0],
-                        "duration_str": shortcut,
-                    }
-
-                timer_thread = threading.Thread(
-                    target=update_timer,
-                    args=(chat_id, session_key, shortcut),
-                    daemon=True,
-                )
-                timer_thread.start()
-        return
-
-    if text == "/stop":
-        session_key = f"{chat_id}:{0 if chat_type != 'private' else user_id}"
-        with session_locks:
-            if session_key in active_sessions:
-                session = active_sessions[session_key]
+            if action == "pause":
                 if session["status"] == "active":
                     session["status"] = "paused"
-                    remaining = int((datetime.fromisoformat(session["end_time"]) - datetime.now()).total_seconds())
-                    session["paused_remaining"] = max(0, remaining)
-                    send_message(chat_id, "⏸ *تم إيقاف المؤقت مؤقتاً*", parse_mode="Markdown")
+                    rem = int((datetime.fromisoformat(session["end_time"]) - datetime.now()).total_seconds())
+                    session["paused_remaining"] = max(0, rem)
+                    edit_message(chat_id, msg_id, "⏸ <b>تم إيقاف المعسكر مؤقتاً...</b>\n<i>اضغط استئناف لإكمال المعسكر.</i>", reply_markup=json.dumps(build_camp_keyboard(session_key)))
+                    answer("✅ تم الإيقاف المؤقت.")
                 else:
-                    send_message(chat_id, "❌ المؤقت متوقف بالفعل.")
-            else:
-                send_message(chat_id, "❌ لا توجد جلسة نشطة حالياً.")
-        return
-
-    if text == "/ready":
-        session_key = f"{chat_id}:{0 if chat_type != 'private' else user_id}"
-        with session_locks:
-            if session_key in active_sessions and active_sessions[session_key]["status"] == "paused":
-                session = active_sessions[session_key]
-                session["status"] = "active"
-                remaining = session["paused_remaining"]
-                start_time = datetime.now()
-                end_time = start_time + timedelta(seconds=remaining)
-                session["start_time"] = start_time.isoformat()
-                session["end_time"] = end_time.isoformat()
-                send_message(chat_id, "▶ *تم استئناف المؤقت*", parse_mode="Markdown")
-
-                timer_thread = threading.Thread(
-                    target=update_timer,
-                    args=(chat_id, session_key, session.get("duration_str", "unknown")),
-                    daemon=True,
-                )
-                timer_thread.start()
-            else:
-                send_message(chat_id, "❌ لا توجد جلسة متوقفة.")
-        return
-
-
-def _do_broadcast(sender_chat_id, broadcast_text):
-    """إرسال رسالة جماعية لجميع المستخدمين"""
-    with user_locks:
-        users = list(known_users.keys())
-    success = 0
-    fail = 0
-    for uid in users:
-        result = send_message(uid, f"📣 *رسالة من الإدارة:*\n\n{broadcast_text}", parse_mode="Markdown")
-        if result.get("ok"):
-            success += 1
-        else:
-            fail += 1
-        time.sleep(0.05)
-    send_message(sender_chat_id, f"✅ تم الإرسال!\n✔️ نجح: {success}\n❌ فشل: {fail}")
-
-
-def handle_callback(callback_query):
-    chat_id = callback_query["message"]["chat"]["id"]
-    user_id = callback_query["from"]["id"]
-    data = callback_query["data"]
-    message_id = callback_query["message"]["message_id"]
-    first_name = callback_query["from"].get("first_name", "")
-    username = callback_query["from"].get("username")
-    cid = callback_query["id"]
-    user = callback_query["from"]
-
-    # تسجيل المستخدم
-    register_user(user)
-
-    # ─── لوحة التحكم ────────────────────────────────────────────
-    if data.startswith("panel_"):
-        handle_panel_callback(callback_query, data)
-        return
-
-    # ─── تحقق الاشتراك ──────────────────────────────────────────
-    if data == "check_subscription":
-        with state_lock:
-            channels = list(forced_channels)
-        if not channels or is_user_subscribed(user_id):
-            answer_callback(cid, "✅ شكراً! تم التحقق من اشتراكك.", show_alert=True)
-            send_message(chat_id, WELCOME_TEXT, parse_mode="HTML")
-            # إشعار المطورين
-            uname = f"@{username}" if username else first_name
-            notify_developers(
-                f"👤 *مستخدم جديد انضم بعد الاشتراك الإجباري!*\n"
-                f"الاسم: {uname}\n"
-                f"ID: `{user_id}`",
-                parse_mode="Markdown"
-            )
-        else:
-            answer_callback(cid, "❌ لم تشترك في جميع القنوات بعد!", show_alert=True)
-        return
-
-    # ─── الانضمام للجلسة ─────────────────────────────────────────
-    if data.startswith("join_"):
-        # فحص الاشتراك
-        with state_lock:
-            channels = list(forced_channels)
-        if channels and not is_user_subscribed(user_id):
-            answer_callback(cid, "⚠️ يجب الاشتراك في القنوات أولاً!", show_alert=True)
-            return
-
-        session_key = data[5:]
-        should_edit = False
-        alert_text = None
-        snapshot = None
-
-        with session_locks:
-            if session_key not in active_sessions:
-                alert_text = "❌ لا توجد جلسة نشطة حالياً."
-            else:
-                session = active_sessions[session_key]
-                participants = session.setdefault("participants", {})
-
-                participant_display = f"المستخدم ( @{username} )" if username else f"المستخدم ( {first_name} )"
-
-                if str(user_id) in participants:
-                    alert_text = "⚠️ انت منضم سابقاً بالفعل!"
+                    answer("⚠️ المعسكر متوقف بالفعل.")
+                    
+            elif action == "resume":
+                if session["status"] == "paused":
+                    session["status"] = "active"
+                    rem = session["paused_remaining"]
+                    st = datetime.now()
+                    session["start_time"] = st.isoformat()
+                    session["end_time"] = (st + timedelta(seconds=rem)).isoformat()
+                    answer("▶️ تم الاستئناف بنجاح!")
+                    threading.Thread(target=update_timer_avetaar, args=(chat_id, session_key), daemon=True).start()
                 else:
-                    participants[str(user_id)] = participant_display
-                    alert_text = "✅ تم انضمامك للمعسكر!"
-                    should_edit = True
+                    answer("⚠️ المعسكر يعمل بالفعل.")
+                    
+            elif action == "stop":
+                end_camp_avetaar(chat_id, session_key, session)
+                del avetaar_active_camps[session_key]
+                req("deleteMessage", json_data={"chat_id": chat_id, "message_id": msg_id})
+                answer("🛑 تم إنهاء المعسكر.")
 
-                snapshot = {
-                    "dua": session.get("dua", ""),
-                    "duration_str": session.get("duration_str", "unknown"),
-                    "start_time": session.get("start_time"),
-                    "end_time": session.get("end_time"),
-                    "participants_count": len(participants),
-                }
+# ================= معالجة الجروبات =================
+def handle_group_join(update):
+    chat_id = update["chat"]["id"]
+    new_status = update["new_chat_member"]["status"]
+    
+    if new_status in ["member", "administrator"]:
+        if chat_id not in db["groups"]:
+            db["groups"].append(chat_id)
+            save_avetaar_db(db)
+            send_message(DEV_ID, f"📢 <b>تمت إضافة البوت لمجموعة جديدة!</b>\n🆔 الآيدي: <code>{chat_id}</code>")
+        
+        msg = (
+            "<b>شكراً لإضافتي في المجموعة 🫂🖤</b>\n"
+            "يرجى رفعي كـ <b>مشرف</b> مع إعطائي الصلاحيات التالية:\n"
+            "📌 حذف وتعديل وتثبيت الرسائل.\n\n"
+            "لبدء معسكر اكتب: <code>/start 1h</code>"
+        )
+        send_message(chat_id, msg)
 
-        if alert_text:
-            answer_callback(cid, alert_text, show_alert=False)
-
-        if not should_edit or not snapshot or not snapshot.get("start_time") or not snapshot.get("end_time"):
-            return
-
-        try:
-            remaining = int((datetime.fromisoformat(snapshot["end_time"]) - datetime.now()).total_seconds())
-            start_time = datetime.fromisoformat(snapshot["start_time"])
-            end_time = datetime.fromisoformat(snapshot["end_time"])
-
-            msg_text = (
-                f"*✨ دعـاء المذاكـرة (قبل البدء):*\n"
-                f"» {snapshot['dua']}\n\n"
-                f"*⏳ الوقت المتبقي:* `{format_time(max(0, remaining))}`\n"
-                f"*⏱️ المدة المحددة:* `{snapshot['duration_str']}`\n"
-                f"*🕒 وقت البدء:* `{format_datetime(start_time)}`\n"
-                f"*🎯 وقت الانتهاء:* `{format_datetime(end_time)}`\n"
-                f"*👥 عدد المشاركين حالياً:* `{snapshot['participants_count']}`\n"
-                f"————————————————————\n"
-                f"• لإيقاف المؤقت: `/stop` | لاستئنافه: `/ready`"
-            )
-
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "انضمام 👥", "callback_data": f"join_{session_key}"}]
-                ]
-            }
-
-            edit_message(chat_id, message_id, msg_text, parse_mode="Markdown", reply_markup=json.dumps(keyboard))
-        except Exception:
-            return
-
-# ─── Main Loop ────────────────────────────────────────────────
-
-def main():
+# ================= التشغيل الأساسي =================
+def run_avetaar_bot():
     offset = 0
-
-    if not TOKEN or TOKEN == "توكن_البوت":
-        print("ERROR: ضع توكن البوت في متغير البيئة STUDY_BOT_TOKEN")
+    if not TOKEN or TOKEN == "توكن_البوت_هنا":
+        print("ERROR: الرجاء وضع التوكن الخاص بك في الكود!")
         return
 
-    print("✅ Study bot running... | #HESHVM")
+    print("✅ Study Bot (Avetaar Edition) is Running Successfully...")
+    send_message(DEV_ID, "✅ <b>تم تشغيل بوت المعسكرات بنجاح (𓂀 الأڤـيـتـار 𓂀)!</b>")
 
     while True:
         try:
-            resp = requests.get(
-                f"{URL}/getUpdates",
-                params={
-                    "timeout": 30,
-                    "offset": offset,
-                    "allowed_updates": ["message", "chat_member", "my_chat_member", "callback_query"],
-                },
-                timeout=40,
-            )
-
+            resp = avetaar_session.get(f"{URL}/getUpdates", params={"timeout": 30, "offset": offset, "allowed_updates":["message", "chat_member", "my_chat_member", "callback_query"]}, timeout=40)
             if not resp.ok:
                 time.sleep(1)
                 continue
 
-            data = resp.json()
-            if not data.get("ok"):
-                time.sleep(1)
-                continue
-
-            for update in data.get("result", []):
+            for update in resp.json().get("result", []):
                 offset = update["update_id"] + 1
-                try:
-                    if "message" in update:
-                        handle_message(update["message"])
-                    elif "my_chat_member" in update:
-                        handle_my_chat_member(update["my_chat_member"])
-                    elif "callback_query" in update:
-                        handle_callback(update["callback_query"])
-                except Exception as e:
-                    print(f"Update handling error: {e}")
-
-        except KeyboardInterrupt:
-            print("Stopped")
-            raise
+                if "message" in update and "text" in update["message"]:
+                    handle_message(update["message"])
+                elif "my_chat_member" in update:
+                    handle_group_join(update["my_chat_member"])
+                elif "callback_query" in update:
+                    handle_callback_avetaar(update["callback_query"])
         except Exception as e:
-            print(f"Main loop error: {e}")
-            time.sleep(1)
-
+            time.sleep(2)
 
 if __name__ == "__main__":
-    main()
-
-# #HESHVM ✍️ — Edited manually with full precision and power 🔥
+    run_avetaar_bot()
