@@ -400,4 +400,4 @@ def run_avetaar_bot():
             time.sleep(2)
 
 if __name__ == "__main__":
-    run_avetaar_bot()
+    run_avetaar_bot() 
